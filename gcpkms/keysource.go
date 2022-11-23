@@ -3,17 +3,17 @@ package gcpkms //import "go.mozilla.org/sops/v3/gcpkms"
 import (
 	"encoding/base64"
 	"fmt"
-	"google.golang.org/api/option"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	"go.mozilla.org/sops/v3/logging"
-
 	"github.com/sirupsen/logrus"
+	"go.mozilla.org/sops/v3/logging"
 	"golang.org/x/net/context"
-	cloudkms "google.golang.org/api/cloudkms/v1"
+
+	kms "cloud.google.com/go/kms/apiv1"
+	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
 )
 
 var log *logrus.Logger
@@ -46,16 +46,20 @@ func (key *MasterKey) Encrypt(dataKey []byte) error {
 		log.WithField("resourceID", key.ResourceID).Info("Encryption failed")
 		return fmt.Errorf("Cannot create GCP KMS service: %w", err)
 	}
-	req := &cloudkms.EncryptRequest{
-		Plaintext: base64.StdEncoding.EncodeToString(dataKey),
+
+	req := &kmspb.EncryptRequest{
+		Name:      key.ResourceID,
+		Plaintext: []byte(base64.StdEncoding.EncodeToString(dataKey)),
 	}
-	resp, err := cloudkmsService.Projects.Locations.KeyRings.CryptoKeys.Encrypt(key.ResourceID, req).Do()
+
+	ctx := context.Background()
+	resp, err := cloudkmsService.Encrypt(ctx, req)
 	if err != nil {
 		log.WithField("resourceID", key.ResourceID).Info("Encryption failed")
 		return fmt.Errorf("Failed to call GCP KMS encryption service: %w", err)
 	}
 	log.WithField("resourceID", key.ResourceID).Info("Encryption succeeded")
-	key.EncryptedKey = resp.Ciphertext
+	key.EncryptedKey = base64.StdEncoding.EncodeToString(resp.Ciphertext)
 	return nil
 }
 
@@ -67,7 +71,7 @@ func (key *MasterKey) EncryptIfNeeded(dataKey []byte) error {
 	return nil
 }
 
-// Decrypt decrypts the EncryptedKey field with CGP KMS and returns the result.
+// Decrypt decrypts the EncryptedKey field with GCP KMS and returns the result.
 func (key *MasterKey) Decrypt() ([]byte, error) {
 	cloudkmsService, err := key.createCloudKMSService()
 	if err != nil {
@@ -75,15 +79,22 @@ func (key *MasterKey) Decrypt() ([]byte, error) {
 		return nil, fmt.Errorf("Cannot create GCP KMS service: %w", err)
 	}
 
-	req := &cloudkms.DecryptRequest{
-		Ciphertext: key.EncryptedKey,
+	ciphertext, _ := base64.StdEncoding.DecodeString(key.EncryptedKey)
+
+	req := &kmspb.DecryptRequest{
+		Name:       key.ResourceID,
+		Ciphertext: ciphertext,
 	}
-	resp, err := cloudkmsService.Projects.Locations.KeyRings.CryptoKeys.Decrypt(key.ResourceID, req).Do()
+
+	ctx := context.Background()
+	resp, err := cloudkmsService.Decrypt(ctx, req)
 	if err != nil {
 		log.WithField("resourceID", key.ResourceID).Info("Decryption failed")
 		return nil, fmt.Errorf("Error decrypting key: %w", err)
 	}
-	encryptedKey, err := base64.StdEncoding.DecodeString(resp.Plaintext)
+	defer cloudkmsService.Close()
+
+	encryptedKey, err := base64.StdEncoding.DecodeString(string(resp.Plaintext))
 	if err != nil {
 		log.WithField("resourceID", key.ResourceID).Info("Decryption failed")
 		return nil, err
@@ -123,7 +134,7 @@ func MasterKeysFromResourceIDString(resourceID string) []*MasterKey {
 	return keys
 }
 
-func (key MasterKey) createCloudKMSService() (*cloudkms.Service, error) {
+func (key MasterKey) createCloudKMSService() (*kms.KeyManagementClient, error) {
 	re := regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+$`)
 	matches := re.FindStringSubmatch(key.ResourceID)
 	if matches == nil {
@@ -131,18 +142,11 @@ func (key MasterKey) createCloudKMSService() (*cloudkms.Service, error) {
 	}
 
 	ctx := context.Background()
-	var options []option.ClientOption
-
-	if credentials, err := getGoogleCredentials(); err != nil {
-		return nil, err
-	} else if len(credentials) > 0 {
-		options = append(options, option.WithCredentialsJSON(credentials))
-	}
-
-	cloudkmsService, err := cloudkms.NewService(ctx, options...)
+	cloudkmsService, err := kms.NewKeyManagementClient(ctx)
 	if err != nil {
 		return nil, err
 	}
+
 	return cloudkmsService, nil
 }
 
