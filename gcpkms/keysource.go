@@ -14,6 +14,8 @@ import (
 
 	kms "cloud.google.com/go/kms/apiv1"
 	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
+	"google.golang.org/api/impersonate"
+	"google.golang.org/api/option"
 )
 
 var log *logrus.Logger
@@ -41,7 +43,13 @@ func (key *MasterKey) SetEncryptedDataKey(enc []byte) {
 
 // Encrypt takes a sops data key, encrypts it with GCP KMS and stores the result in the EncryptedKey field
 func (key *MasterKey) Encrypt(dataKey []byte) error {
-	cloudkmsService, err := key.createCloudKMSService()
+	err := key.CheckResourceID()
+	if err != nil {
+		log.WithField("resourceID", key.ResourceID).Info("Encryption failed")
+		return fmt.Errorf("ResourceID is not valid: %w", err)
+	}
+
+	cloudkmsService, err := createCloudKMSService()
 	if err != nil {
 		log.WithField("resourceID", key.ResourceID).Info("Encryption failed")
 		return fmt.Errorf("Cannot create GCP KMS service: %w", err)
@@ -73,7 +81,13 @@ func (key *MasterKey) EncryptIfNeeded(dataKey []byte) error {
 
 // Decrypt decrypts the EncryptedKey field with GCP KMS and returns the result.
 func (key *MasterKey) Decrypt() ([]byte, error) {
-	cloudkmsService, err := key.createCloudKMSService()
+	err := key.CheckResourceID()
+	if err != nil {
+		log.WithField("resourceID", key.ResourceID).Info("Decryption failed")
+		return nil, fmt.Errorf("ResourceID is not valid: %w", err)
+	}
+
+	cloudkmsService, err := createCloudKMSService()
 	if err != nil {
 		log.WithField("resourceID", key.ResourceID).Info("Decryption failed")
 		return nil, fmt.Errorf("Cannot create GCP KMS service: %w", err)
@@ -134,20 +148,42 @@ func MasterKeysFromResourceIDString(resourceID string) []*MasterKey {
 	return keys
 }
 
-func (key MasterKey) createCloudKMSService() (*kms.KeyManagementClient, error) {
+func createCloudKMSService() (*kms.KeyManagementClient, error) {
+	ctx := context.Background()
+
+	if impersonation_email, exists := os.LookupEnv("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT"); exists {
+		fmt.Println("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT is set.")
+		// Base credentials sourced from ADC or provided client options.
+		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
+			TargetPrincipal: impersonation_email,
+			Scopes:          []string{"https://www.googleapis.com/auth/cloud-platform"},
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		return kms.NewKeyManagementClient(ctx, option.WithTokenSource(ts))
+	}
+
+	defaultCredentials, exists := os.LookupEnv("GOOGLE_CREDENTIALS")
+	if _, err := os.Stat(defaultCredentials); exists && err == nil {
+		return kms.NewKeyManagementClient(ctx, option.WithCredentialsFile(defaultCredentials))
+	}
+	if exists {
+		return kms.NewKeyManagementClient(ctx, option.WithCredentialsJSON([]byte(defaultCredentials)))
+	}
+
+	return kms.NewKeyManagementClient(ctx)
+}
+
+func (key MasterKey) CheckResourceID() error {
 	re := regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+$`)
 	matches := re.FindStringSubmatch(key.ResourceID)
 	if matches == nil {
-		return nil, fmt.Errorf("No valid resourceId found in %q", key.ResourceID)
+		return fmt.Errorf("No valid resourceId found in %q", key.ResourceID)
 	}
 
-	ctx := context.Background()
-	cloudkmsService, err := kms.NewKeyManagementClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return cloudkmsService, nil
+	return nil
 }
 
 // ToMap converts the MasterKey to a map for serialization purposes
@@ -157,17 +193,4 @@ func (key MasterKey) ToMap() map[string]interface{} {
 	out["enc"] = key.EncryptedKey
 	out["created_at"] = key.CreationDate.UTC().Format(time.RFC3339)
 	return out
-}
-
-// getGoogleCredentials looks for a GCP Service Account in the environment
-// variable: GOOGLE_CREDENTIALS, set as either a path to a credentials file or directly as the
-// variable's value in JSON format.
-//
-// If not set, will default to use GOOGLE_APPLICATION_CREDENTIALS
-func getGoogleCredentials() ([]byte, error) {
-	defaultCredentials := os.Getenv("GOOGLE_CREDENTIALS")
-	if _, err := os.Stat(defaultCredentials); err == nil {
-		return os.ReadFile(defaultCredentials)
-	}
-	return []byte(defaultCredentials), nil
 }
