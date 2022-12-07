@@ -151,8 +151,7 @@ func MasterKeysFromResourceIDString(resourceID string) []*MasterKey {
 func createCloudKMSService() (*kms.KeyManagementClient, error) {
 	ctx := context.Background()
 
-	if impersonation_email, exists := os.LookupEnv("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT"); exists {
-		fmt.Println("GOOGLE_IMPERSONATE_SERVICE_ACCOUNT is set.")
+	if impersonation_email, exists := os.LookupEnv("GCP_IMPERSONATION_EMAIL"); exists {
 		// Base credentials sourced from ADC or provided client options.
 		ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
 			TargetPrincipal: impersonation_email,
